@@ -96,6 +96,7 @@ def apply_params_to_form_data(form_data: dict, model: dict, params: dict | None 
         'system': str,
         'note_id': str,
         'tool_approval_mode': str,
+        'memory_approval_mode': str,
     }
 
     for key in list(params.keys()):
@@ -151,6 +152,7 @@ def remove_open_webui_params(params: dict) -> dict:
         'system': str,
         'note_id': str,
         'tool_approval_mode': str,
+        'memory_approval_mode': str,
     }
 
     for key in list(params.keys()):

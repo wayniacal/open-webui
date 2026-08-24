@@ -11,7 +11,13 @@
 	import DropdownMenu from '$lib/components/common/DropdownMenu.svelte';
 	import ExperimentalBadge from '$lib/components/common/ExperimentalBadge.svelte';
 	import MemoryModal from './Personalization/MemoryModal.svelte';
-	import { deleteMemoriesByUserId, deleteMemoryById, getMemories } from '$lib/apis/memories';
+	import MemoryReviewModal from './Personalization/MemoryReviewModal.svelte';
+	import {
+		deleteMemoriesByUserId,
+		deleteMemoryById,
+		getMemories,
+		getMemoryProposals
+	} from '$lib/apis/memories';
 	import { toast } from 'svelte-sonner';
 	import UserSettingRow from './UserSettingRow.svelte';
 	import UserSettingSection from './UserSettingSection.svelte';
@@ -29,10 +35,20 @@
 
 	// Addons
 	let enableMemory = false;
+	// Whether the background review must be confirmed before it saves. Carried
+	// as `params.memory_approval_mode` ('auto' | 'ask') to match
+	// `tool_approval_mode`, the equivalent human-in-the-loop control, rather
+	// than introducing a second shape for the same idea.
+	let memoryApprovalAsk = false;
 	let memories: Memory[] = [];
 	let loadingMemories = true;
 
 	let showMemoryModal = false;
+	let showMemoryReviewModal = false;
+	// Memories the background review wants to save but has not. Zero unless
+	// `memory_approval_mode` is set to `ask`, so the banner below
+	// simply never appears for anyone who has not opted in.
+	let proposalCount = 0;
 	let selectedMemory: Memory | null = null;
 	let showClearConfirmDialog = false;
 	let showDeleteConfirm = false;
@@ -46,6 +62,11 @@
 		type?: string;
 		path?: string;
 		updated_at?: number;
+	};
+
+	const loadProposalCount = async () => {
+		const proposals = await getMemoryProposals(localStorage.token).catch(() => []);
+		proposalCount = (proposals ?? []).length;
 	};
 
 	const loadMemories = async () => {
@@ -98,7 +119,9 @@
 
 	onMount(async () => {
 		enableMemory = $settings?.memory ?? $config?.features?.enable_memories ?? false;
+		memoryApprovalAsk = ($settings?.params?.memory_approval_mode ?? 'auto') === 'ask';
 		await loadMemories();
+		await loadProposalCount();
 	});
 </script>
 
@@ -136,6 +159,27 @@
 			</UserSettingRow>
 
 			{#if enableMemory}
+				<UserSettingRow
+					title={$i18n.t('Review before saving')}
+					description={$i18n.t(
+						'Memories suggested from your conversations wait for your approval instead of being saved automatically.'
+					)}
+				>
+					<Switch
+						bind:state={memoryApprovalAsk}
+						on:change={async () => {
+							saveSettings({
+								params: {
+									...($settings?.params ?? {}),
+									memory_approval_mode: memoryApprovalAsk ? 'ask' : 'auto'
+								}
+							});
+						}}
+					/>
+				</UserSettingRow>
+			{/if}
+
+			{#if enableMemory}
 				<div>
 					<div class="mb-1 flex items-center">
 						<div class="text-xs text-gray-600 dark:text-gray-400">
@@ -151,6 +195,21 @@
 							<Spinner className="size-4" />
 						</div>
 					{:else}
+						{#if proposalCount > 0}
+							<button
+								type="button"
+								class="mb-2 flex w-full items-center justify-between gap-2 rounded-lg bg-gray-50 px-3 py-2 text-left text-xs transition-colors hover:bg-gray-100 dark:bg-gray-850 dark:hover:bg-gray-800"
+								on:click={() => (showMemoryReviewModal = true)}
+							>
+								<span class="min-w-0 truncate text-gray-700 dark:text-gray-300">
+									{$i18n.t('{{count}} suggested memories awaiting your review', {
+										count: proposalCount
+									})}
+								</span>
+								<span class="shrink-0 text-gray-500">{$i18n.t('Review')}</span>
+							</button>
+						{/if}
+
 						<div class="mb-2 flex min-w-0 items-center justify-between gap-3">
 							{#if memories.length > 0}
 								<div class="flex min-w-0 flex-1 items-center gap-2">
@@ -315,6 +374,14 @@
 		</div>
 	</div>
 </ConfirmDialog>
+
+<MemoryReviewModal
+	bind:show={showMemoryReviewModal}
+	on:save={async () => {
+		await loadMemories();
+		await loadProposalCount();
+	}}
+/>
 
 <MemoryModal
 	bind:show={showMemoryModal}

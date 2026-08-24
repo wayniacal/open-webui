@@ -12,6 +12,7 @@ from open_webui.internal.db import get_async_session
 from open_webui.models.config import Config
 from open_webui.models.memories import Memories, MemoryModel
 from open_webui.models.users import Users
+from open_webui.models.memory_proposals import MemoryProposalModel, MemoryProposals
 from open_webui.retrieval.vector.async_client import ASYNC_VECTOR_DB_CLIENT
 from open_webui.utils.access_control import has_permission
 from open_webui.utils.auth import get_admin_user, get_verified_user
@@ -45,6 +46,23 @@ async def check_memories_permission(user):
             status_code=status.HTTP_403_FORBIDDEN,
             detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
         )
+
+
+def background_review_requires_approval(metadata: dict | None) -> bool:
+    """Whether this turn's background-review writes must be confirmed.
+
+    Follows the same shape as `tool_approval_mode`, the human-in-the-loop
+    control this project already has: a mode carried in `params`, resolved
+    per-chat with a fallback to the user's own default
+    (`params ?? settings.params` on the client). `auto` is the existing
+    behaviour and the default, so nobody acquires a review queue they did not
+    ask for; `ask` queues instead of storing.
+
+    A mode rather than a boolean, and a param rather than a new settings key,
+    because that is what the equivalent control already looks like here.
+    """
+    params = (metadata or {}).get('params') or {}
+    return params.get('memory_approval_mode') == 'ask'
 
 
 ############################
@@ -92,7 +110,37 @@ class MemoryOperationModel(BaseModel):
 
 class UpdateMemoriesForm(BaseModel):
     operations: list[MemoryOperationModel]
-    source: Literal['tool', 'background_review'] | None = None
+    # `review_approved` is a background-review write a human confirmed. It is
+    # distinct from `tool` so the provenance in `meta.created_by` survives the
+    # round trip through the queue — otherwise an approved memory would be
+    # indistinguishable from one the model wrote mid-conversation.
+    source: Literal['tool', 'background_review', 'review_approved'] | None = None
+
+
+class ReviewedMemoryModel(BaseModel):
+    """One entry as the human left it after reviewing.
+
+    Not the proposal: the text may have been edited, and an entry the review
+    never suggested may have been added outright. Only `action` and the
+    optional `id` tie it back to a proposed operation.
+    """
+
+    action: Literal['add', 'replace', 'remove', 'move'] = 'add'
+    id: str | None = None
+    content: str | None = None
+    type: Literal['user', 'context'] = 'context'
+    path: str | None = None
+
+
+class ApplyMemoryProposalsForm(BaseModel):
+    """The reviewed set, as the desired final outcome of the batch.
+
+    Whatever is listed is applied; every queued proposal is then cleared,
+    accepted or not. So rejecting is simply omitting, and the human can add
+    entries the review never proposed in the same pass.
+    """
+
+    memories: list[ReviewedMemoryModel] = []
 
 
 class SearchMemoriesForm(BaseModel):
@@ -250,6 +298,33 @@ async def update_memories(
                 'message_id': metadata.get('message_id'),
                 'model': metadata.get('model'),
             }
+
+    # Human-in-the-loop gate. The background review decides on its own what is
+    # worth remembering; with approval required its operations are queued for a
+    # person to confirm instead of applied. Placed before anything happens, so
+    # a queued operation touches neither the database, the vector collection,
+    # nor the event stream.
+    #
+    # Only `background_review` is gated. A `tool` write is the model acting
+    # inside a conversation the user is watching, and a manual edit is the user
+    # themselves — asking them to approve their own edit would be noise.
+    if source == 'background_review' and background_review_requires_approval(metadata):
+        proposals = await MemoryProposals.insert_proposals(user.id, operations)
+        await publish_event(
+            request,
+            EVENTS.MEMORY_PROPOSED,
+            actor=user,
+            subject_id=None,
+            data={'count': len(proposals)},
+        )
+        return [
+            {
+                'action': proposal.action,
+                'status': 'pending_review',
+                'id': proposal.id,
+            }
+            for proposal in proposals
+        ]
 
     try:
         results = await Memories.apply_memory_operations(user.id, operations)
@@ -477,6 +552,74 @@ async def reindex_memories_from_vector_db(
         data={'count': total_memories, 'user_count': len(users), 'reindex': True},
     )
     return {'status': True, 'total_users': len(users), 'total_memories': total_memories}
+
+
+############################
+# MemoryProposals — human review of background-review writes
+############################
+
+
+@router.get('/proposals', response_model=list[MemoryProposalModel])
+async def get_memory_proposals(user=Depends(get_verified_user)):
+    """Memory operations the background review is waiting to have confirmed."""
+    await check_memories_permission(user)
+    return await MemoryProposals.get_proposals_by_user_id(user.id)
+
+
+@router.post('/proposals/apply', response_model=list[dict])
+async def apply_memory_proposals(
+    request: Request,
+    form_data: ApplyMemoryProposalsForm,
+    user=Depends(get_verified_user),
+):
+    """Apply a reviewed batch and clear the queue.
+
+    The submitted list is the desired outcome, not a set of approvals: an entry
+    may have been reworded, and one the review never proposed may have been
+    added. Everything listed is applied through the ordinary write path, so an
+    entry a human typed is embedded and stored exactly like one the model
+    suggested.
+
+    The queue is cleared whether or not anything was accepted — that is what
+    makes rejection simply "leave it out".
+    """
+    await check_memories_permission(user)
+
+    operations = []
+    for entry in form_data.memories:
+        operation = {
+            'action': entry.action,
+            'id': entry.id,
+            'content': entry.content,
+            'type': entry.type,
+            'path': entry.path,
+        }
+        operations.append({key: value for key, value in operation.items() if value is not None})
+
+    results = []
+    if operations:
+        # Reuse the ordinary path rather than reimplementing apply + embed +
+        # publish. It already handles validation, the vector upsert and the
+        # events; duplicating it would be the obvious place for the two to
+        # drift.
+        results = await update_memories(
+            request,
+            UpdateMemoriesForm(operations=operations, source='review_approved'),
+            user,
+        )
+
+    # Cleared last: if applying raised, the queue survives for another attempt
+    # rather than being lost along with the failure.
+    await MemoryProposals.delete_proposals_by_user_id(user.id)
+    return results
+
+
+@router.delete('/proposals', response_model=bool)
+async def discard_memory_proposals(user=Depends(get_verified_user)):
+    """Reject everything currently queued."""
+    await check_memories_permission(user)
+    await MemoryProposals.delete_proposals_by_user_id(user.id)
+    return True
 
 
 @router.post('/reset', response_model=bool)
