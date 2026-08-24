@@ -344,6 +344,11 @@ class EventDefinitions(BaseModel):
     MEMORY_RESET: EventDefinition = EventDefinition(
         name='memory.reset', description='A memory was reset.', message='Memory reset'
     )
+    MEMORY_PROPOSED: EventDefinition = EventDefinition(
+        name='memory.proposed',
+        description='The background review proposed memories awaiting approval.',
+        message='Memories awaiting review',
+    )
     KNOWLEDGE_CREATED: EventDefinition = EventDefinition(
         name='knowledge.created', description='A knowledge was created.', message='Knowledge created'
     )
